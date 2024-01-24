@@ -66,6 +66,7 @@
 /* macros */
 #define MAX(A, B)               ((A) > (B) ? (A) : (B))
 #define MIN(A, B)               ((A) < (B) ? (A) : (B))
+#define ROUND(X)                ((int)((X < 0) ? (X - 0.5) : (X + 0.5)))
 #define CLEANMASK(mask)         (mask & ~WLR_MODIFIER_CAPS)
 #define VISIBLEON(C, M)         ((M) && (C)->mon == (M) && ((C)->tags & (M)->tagset[(M)->seltags]))
 #define LENGTH(X)               (sizeof X / sizeof X[0])
@@ -206,7 +207,7 @@ struct Monitor {
 	unsigned int seltags;
 	unsigned int sellt;
 	uint32_t tagset[2];
-	double mfact;
+	float mfact;
 	int gamma_lut_changed;
 	int nmaster;
 	char ltsymbol[16];
@@ -398,7 +399,8 @@ static struct zdwl_ipc_manager_v2_interface dwl_manager_implementation = {.relea
 static struct zdwl_ipc_output_v2_interface dwl_output_implementation = {.release = dwl_ipc_output_release, .set_tags = dwl_ipc_output_set_tags, .set_layout = dwl_ipc_output_set_layout, .set_client_tags = dwl_ipc_output_set_client_tags};
 
 static struct wlr_seat *seat;
-static KeyboardGroup kb_group;
+static KeyboardGroup kb_group = {0};
+static KeyboardGroup vkb_group = {0};
 static struct wlr_surface *held_grab;
 static unsigned int cursor_mode;
 static Client *grabc;
@@ -451,9 +453,9 @@ applybounds(Client *c, struct wlr_box *bbox)
 		c->geom.x = bbox->x + bbox->width - c->geom.width;
 	if (c->geom.y >= bbox->y + bbox->height)
 		c->geom.y = bbox->y + bbox->height - c->geom.height;
-	if (c->geom.x + c->geom.width + 2 * c->bw <= bbox->x)
+	if (c->geom.x + c->geom.width + 2 * (int)c->bw <= bbox->x)
 		c->geom.x = bbox->x;
-	if (c->geom.y + c->geom.height + 2 * c->bw <= bbox->y)
+	if (c->geom.y + c->geom.height + 2 * (int)c->bw <= bbox->y)
 		c->geom.y = bbox->y;
 }
 
@@ -462,7 +464,8 @@ applyrules(Client *c)
 {
 	/* rule matching */
 	const char *appid, *title;
-	uint32_t i, newtags = 0;
+	uint32_t newtags = 0;
+	int i;
 	const Rule *r;
 	Monitor *mon = selmon, *m;
 
@@ -556,15 +559,15 @@ arrangelayers(Monitor *m)
 		arrangelayer(m, &m->layers[i], &usable_area, 0);
 
 	/* Find topmost keyboard interactive layer, if such a layer exists */
-	for (i = 0; i < LENGTH(layers_above_shell); i++) {
+	for (i = 0; i < (int)LENGTH(layers_above_shell); i++) {
 		wl_list_for_each_reverse(l, &m->layers[layers_above_shell[i]], link) {
-			if (!locked && l->layer_surface->current.keyboard_interactive && l->mapped) {
-				/* Deactivate the focused client. */
-				focusclient(NULL, 0);
-				exclusive_focus = l;
-				client_notify_enter(l->layer_surface->surface, wlr_seat_get_keyboard(seat));
-				return;
-			}
+			if (locked || !l->layer_surface->current.keyboard_interactive || !l->mapped)
+				continue;
+			/* Deactivate the focused client. */
+			focusclient(NULL, 0);
+			exclusive_focus = l;
+			client_notify_enter(l->layer_surface->surface, wlr_seat_get_keyboard(seat));
+			return;
 		}
 	}
 }
@@ -711,6 +714,7 @@ cleanup(void)
 
 	/* Remove event source that use the dpy event loop before destroying dpy */
 	wl_event_source_remove(kb_group.key_repeat_source);
+	wl_event_source_remove(vkb_group.key_repeat_source);
 
 	wl_display_destroy(dpy);
 	/* Destroy after the wayland display (when the monitors are already destroyed)
@@ -723,7 +727,7 @@ cleanupmon(struct wl_listener *listener, void *data)
 {
 	Monitor *m = wl_container_of(listener, m, destroy);
 	LayerSurface *l, *tmp;
-	int i;
+	size_t i;
 
 	DwlIpcOutput *ipc_output, *ipc_output_tmp;
 	wl_list_for_each_safe(ipc_output, ipc_output_tmp, &m->dwl_ipc_outputs, link)
@@ -741,10 +745,10 @@ cleanupmon(struct wl_listener *listener, void *data)
 	m->wlr_output->data = NULL;
 	wlr_output_layout_remove(output_layout, m->wlr_output);
 	wlr_scene_output_destroy(m->scene_output);
-	wlr_scene_node_destroy(&m->fullscreen_bg->node);
 
 	free(m->pertag);
 	closemon(m);
+	wlr_scene_node_destroy(&m->fullscreen_bg->node);
 	free(m);
 }
 
@@ -781,7 +785,6 @@ commitlayersurfacenotify(struct wl_listener *listener, void *data)
 	struct wlr_layer_surface_v1 *layer_surface = l->layer_surface;
 	struct wlr_scene_tree *scene_layer = layers[layermap[layer_surface->current.layer]];
 
-
 	if (layer_surface->current.committed == 0 && l->mapped == layer_surface->surface->mapped)
 		return;
 	l->mapped = layer_surface->surface->mapped;
@@ -802,7 +805,7 @@ commitnotify(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, commit);
 
-	if (client_surface(c)->mapped)
+	if (client_surface(c)->mapped && c->mon)
 		resize(c, c->geom, (c->isfloating && !c->isfullscreen));
 
 	/* mark a pending resize as completed */
@@ -1639,16 +1642,15 @@ keybinding(uint32_t mods, xkb_keysym_t sym)
 	 * processing keys, rather than passing them on to the client for its own
 	 * processing.
 	 */
-	int handled = 0;
 	const Key *k;
 	for (k = keys; k < END(keys); k++) {
 		if (CLEANMASK(mods) == CLEANMASK(k->mod)
 				&& sym == k->keysym && k->func) {
 			k->func(&k->arg);
-			handled = 1;
+			return 1;
 		}
 	}
-	return handled;
+	return 0;
 }
 
 void
@@ -1673,9 +1675,10 @@ keypress(struct wl_listener *listener, void *data)
 
 	/* On _press_ if there is no active screen locker,
 	 * attempt to process a compositor keybinding. */
-	if (!locked && event->state == WL_KEYBOARD_KEY_STATE_PRESSED)
+	if (!locked && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		for (i = 0; i < nsyms; i++)
 			handled = keybinding(mods, syms[i]) || handled;
+	}
 
 	if (handled && group->wlr_group->keyboard.repeat_info.delay > 0) {
 		group->mods = mods;
@@ -1691,6 +1694,7 @@ keypress(struct wl_listener *listener, void *data)
 	if (handled)
 		return;
 
+	wlr_seat_set_keyboard(seat, &group->wlr_group->keyboard);
 	/* Pass unhandled keycodes along to the client. */
 	wlr_seat_keyboard_notify_key(seat, event->time_msec,
 			event->keycode, event->state);
@@ -1703,6 +1707,7 @@ keypressmod(struct wl_listener *listener, void *data)
 	 * pressed. We simply communicate this to the client. */
 	KeyboardGroup *group = wl_container_of(listener, group, modifiers);
 
+	wlr_seat_set_keyboard(seat, &group->wlr_group->keyboard);
 	/* Send modifiers to the client. */
 	wlr_seat_keyboard_notify_modifiers(seat,
 			&group->wlr_group->keyboard.modifiers);
@@ -1760,7 +1765,6 @@ locksession(struct wl_listener *listener, void *data)
 void
 maplayersurfacenotify(struct wl_listener *listener, void *data)
 {
-	LayerSurface *l = wl_container_of(listener, l, map);
 	motionnotify(0);
 }
 
@@ -1899,17 +1903,17 @@ motionnotify(uint32_t time)
 	}
 
 	/* Update drag icon's position */
-	wlr_scene_node_set_position(&drag_icon->node, cursor->x, cursor->y);
+	wlr_scene_node_set_position(&drag_icon->node, ROUND(cursor->x), ROUND(cursor->y));
 
 	/* If we are currently grabbing the mouse, handle and return */
 	if (cursor_mode == CurMove) {
 		/* Move the grabbed client to the new position. */
-		resize(grabc, (struct wlr_box){.x = cursor->x - grabcx, .y = cursor->y - grabcy,
+		resize(grabc, (struct wlr_box){.x = ROUND(cursor->x) - grabcx, .y = ROUND(cursor->y) - grabcy,
 			.width = grabc->geom.width, .height = grabc->geom.height}, 1);
 		return;
 	} else if (cursor_mode == CurResize) {
 		resize(grabc, (struct wlr_box){.x = grabc->geom.x, .y = grabc->geom.y,
-			.width = cursor->x - grabc->geom.x, .height = cursor->y - grabc->geom.y}, 1);
+			.width = ROUND(cursor->x) - grabc->geom.x, .height = ROUND(cursor->y) - grabc->geom.y}, 1);
 		return;
 	}
 
@@ -1961,8 +1965,8 @@ moveresize(const Arg *arg)
 	setfloating(grabc, 1);
 	switch (cursor_mode = arg->ui) {
 	case CurMove:
-		grabcx = cursor->x - grabc->geom.x;
-		grabcy = cursor->y - grabc->geom.y;
+		grabcx = ROUND(cursor->x) - grabc->geom.x;
+		grabcy = ROUND(cursor->y) - grabc->geom.y;
 		wlr_cursor_set_xcursor(cursor, cursor_mgr, "fleur");
 		break;
 	case CurResize:
@@ -2035,9 +2039,6 @@ apply_or_test:
 	else
 		wlr_output_configuration_v1_send_failed(config);
 	wlr_output_configuration_v1_destroy(config);
-
-	/* TODO: use a wrapper function? */
-	updatemons(NULL, NULL);
 }
 
 void
@@ -2323,6 +2324,8 @@ setgamma(struct wl_listener *listener, void *data)
 {
 	struct wlr_gamma_control_manager_v1_set_gamma_event *event = data;
 	Monitor *m = event->output->data;
+	if (!m)
+		return;
 	m->gamma_lut_changed = 1;
 	wlr_output_schedule_frame(m->wlr_output);
 }
@@ -2349,7 +2352,7 @@ setmfact(const Arg *arg)
 
 	if (!arg || !selmon || !selmon->lt[selmon->sellt]->arrange)
 		return;
-	f = arg->f < 1.0 ? arg->f + selmon->mfact : arg->f - 1.0;
+	f = arg->f < 1.0f ? arg->f + selmon->mfact : arg->f - 1.0f;
 	if (f < 0.1 || f > 0.9)
 		return;
 	selmon->mfact = selmon->pertag->mfacts[selmon->pertag->curtag] = f;
@@ -2411,7 +2414,7 @@ setup(void)
 	struct sigaction sa = {.sa_flags = SA_RESTART, .sa_handler = handlesig};
 	sigemptyset(&sa.sa_mask);
 
-	for (i = 0; i < LENGTH(sig); i++)
+	for (i = 0; i < (int)LENGTH(sig); i++)
 		sigaction(sig[i], &sa, NULL);
 
 	wlr_log_init(log_level, NULL);
@@ -2521,13 +2524,13 @@ setup(void)
 	wl_signal_add(&session_lock_mgr->events.new_lock, &lock_listener);
 	LISTEN_STATIC(&session_lock_mgr->events.destroy, destroysessionmgr);
 	locked_bg = wlr_scene_rect_create(layers[LyrBlock], sgeom.width, sgeom.height,
-			(float [4]){0.1, 0.1, 0.1, 1.0});
+			(float [4]){0.1f, 0.1f, 0.1f, 1.0f});
 	wlr_scene_node_set_enabled(&locked_bg->node, 0);
 
 	/* Use decoration protocols to negotiate server-side decorations */
 	wlr_server_decoration_manager_set_default_mode(
 			wlr_server_decoration_manager_create(dpy),
-				WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
+			WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
 	xdg_decoration_mgr = wlr_xdg_decoration_manager_v1_create(dpy);
 	LISTEN_STATIC(&xdg_decoration_mgr->events.new_toplevel_decoration, createdecoration);
 
@@ -2588,6 +2591,13 @@ setup(void)
 	kb_group.wlr_group = wlr_keyboard_group_create();
 	kb_group.wlr_group->data = &kb_group;
 
+	/*
+	 * Virtual keyboards need to be in a different group
+	 * https://codeberg.org/dwl/dwl/issues/554
+	 */
+	vkb_group.wlr_group = wlr_keyboard_group_create();
+	vkb_group.wlr_group->data = &vkb_group;
+
 	/* Prepare an XKB keymap and assign it to the keyboard group. */
 	context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	if (!(keymap = xkb_keymap_new_from_names(context, &xkb_rules,
@@ -2595,17 +2605,23 @@ setup(void)
 		die("failed to compile keymap");
 
 	wlr_keyboard_set_keymap(&kb_group.wlr_group->keyboard, keymap);
+	wlr_keyboard_set_keymap(&vkb_group.wlr_group->keyboard, keymap);
 	xkb_keymap_unref(keymap);
 	xkb_context_unref(context);
 
 	wlr_keyboard_set_repeat_info(&kb_group.wlr_group->keyboard, repeat_rate, repeat_delay);
+	wlr_keyboard_set_repeat_info(&vkb_group.wlr_group->keyboard, repeat_rate, repeat_delay);
 
 	/* Set up listeners for keyboard events */
 	LISTEN(&kb_group.wlr_group->keyboard.events.key, &kb_group.key, keypress);
 	LISTEN(&kb_group.wlr_group->keyboard.events.modifiers, &kb_group.modifiers, keypressmod);
+	LISTEN(&vkb_group.wlr_group->keyboard.events.key, &vkb_group.key, keypress);
+	LISTEN(&vkb_group.wlr_group->keyboard.events.modifiers, &vkb_group.modifiers, keypressmod);
 
 	kb_group.key_repeat_source = wl_event_loop_add_timer(
 			wl_display_get_event_loop(dpy), keyrepeat, &kb_group);
+	vkb_group.key_repeat_source = wl_event_loop_add_timer(
+			wl_display_get_event_loop(dpy), keyrepeat, &vkb_group);
 
 	/* A seat can only have one keyboard, but this is a limitation of the
 	 * Wayland protocol - not wlroots. We assign all connected keyboards to the
@@ -2621,6 +2637,10 @@ setup(void)
 	wlr_scene_set_presentation(scene, wlr_presentation_create(dpy, backend));
 	wl_global_create(dpy, &zdwl_ipc_manager_v2_interface, 2, NULL, dwl_ipc_manager_bind);
 
+	/* Make sure XWayland clients don't connect to the parent X server,
+	 * e.g when running in the x11 backend or the wayland backend and the
+	 * compositor has Xwayland support */
+	unsetenv("DISPLAY");
 #ifdef XWAYLAND
 	/*
 	 * Initialise the XWayland X server.
@@ -2683,7 +2703,8 @@ tagmon(const Arg *arg)
 void
 tile(Monitor *m)
 {
-	unsigned int i, n = 0, mw, my, ty;
+	unsigned int mw, my, ty;
+	int i, n = 0;
 	Client *c;
 
 	wl_list_for_each(c, &clients, link)
@@ -2693,7 +2714,7 @@ tile(Monitor *m)
 		return;
 
 	if (n > m->nmaster)
-		mw = m->nmaster ? m->w.width * m->mfact : 0;
+		mw = m->nmaster ? ROUND(m->w.width * m->mfact) : 0;
 	else
 		mw = m->w.width;
 	i = my = ty = 0;
@@ -2819,10 +2840,10 @@ unmapnotify(struct wl_listener *listener, void *data)
 	}
 
 	if (client_is_unmanaged(c)) {
-		if (c == exclusive_focus)
+		if (c == exclusive_focus) {
 			exclusive_focus = NULL;
-		if (client_surface(c) == seat->keyboard_state.focused_surface)
 			focusclient(focustop(selmon), 1);
+		}
 	} else {
 		wl_list_remove(&c->link);
 		setmon(c, NULL, 0);
@@ -2862,10 +2883,11 @@ updatemons(struct wl_listener *listener, void *data)
 		m->m = m->w = (struct wlr_box){0};
 	}
 	/* Insert outputs that need to */
-	wl_list_for_each(m, &mons, link)
+	wl_list_for_each(m, &mons, link) {
 		if (m->wlr_output->enabled
 				&& !wlr_output_layout_get(output_layout, m->wlr_output))
 			wlr_output_layout_add_auto(output_layout, m->wlr_output);
+	}
 
 	/* Now that we update the output layout we can get its box */
 	wlr_output_layout_get_box(output_layout, NULL, &sgeom);
@@ -2998,7 +3020,12 @@ void
 virtualkeyboard(struct wl_listener *listener, void *data)
 {
 	struct wlr_virtual_keyboard_v1 *keyboard = data;
-	createkeyboard(&keyboard->keyboard);
+	/* Set the keymap to match the group keymap */
+	wlr_keyboard_set_keymap(&keyboard->keyboard, vkb_group.wlr_group->keyboard.keymap);
+	wlr_keyboard_set_repeat_info(&keyboard->keyboard, repeat_rate, repeat_delay);
+
+	/* Add the new keyboard to the group */
+	wlr_keyboard_group_add_keyboard(vkb_group.wlr_group, &keyboard->keyboard);
 }
 
 Monitor *
